@@ -28,6 +28,9 @@ import "@uma/core/contracts/data-verification-mechanism/interfaces/IdentifierWhi
  *      restarts that SETTLEMENT_TIMEOUT window, and emergencyRefund() stays closed for as long as
  *      the current oracle request has a proposal or dispute in progress, because a 0.5/0.5 refund
  *      paid out before a real YES/NO price lands would leave the market under-collateralized.
+ *      The first successful emergencyRefund() latches refundMode: from then on the market is terminal,
+ *      every remaining token (Long or Short) is worth exactly 0.5 collateral, and any OO proposal,
+ *      dispute or settlement arriving afterwards is ignored (see priceSettled / priceDisputed).
  *
  * Resolution values:
  *   - 1e18 (YES): Long tokens worth 1 collateral each, Short tokens worth 0.
@@ -64,6 +67,13 @@ contract EventBasedPredictionMarket is Testable {
     // extends the deadline, so a stream of disputes cannot keep emergencyRefund() closed forever.
     uint256 public constant MAX_DISPUTE_EXTENSIONS = 3;
     uint256 public disputeCount;
+
+    // Latched by the first successful emergencyRefund(). Once true the market is terminal: all tokens
+    // redeem at 0.5 and the Optimistic Oracle result (even if proposed/settled later) is ignored.
+    // The Requested-state guard in emergencyRefund() only covers proposals that exist *before* the first
+    // refund; a proposal made afterwards on the still-Requested request would otherwise be applied to a
+    // pool that no longer matches the token supply, leaving the remaining holders under-collateralised.
+    bool public refundMode;
 
     // External contract interfaces.
     ExpandedERC20 public collateralToken;
@@ -160,6 +170,8 @@ contract EventBasedPredictionMarket is Testable {
 
     /**
      * @notice Callback: called by the Optimistic Oracle when a price settles (liveness expired without dispute).
+     * In refundMode this is a deliberate no-op that must never revert: OptimisticOracleV2._settle calls this
+     * callback without try/catch, so a revert here would make the OO request unsettleable.
      * @param identifier The price identifier (must be YES_OR_NO_QUERY).
      * @param timestamp The request timestamp.
      * @param ancillaryData The ancillary data (must match customAncillaryData).
@@ -173,6 +185,11 @@ contract EventBasedPredictionMarket is Testable {
     ) external {
         OptimisticOracleV2Interface optimisticOracle = getOptimisticOracle();
         require(msg.sender == address(optimisticOracle), "Not authorized");
+
+        // Refund mode: the oracle result no longer matters. Return right after the caller check (before the
+        // identifier / ancillary checks) so the genuine OO callback can never revert here.
+        if (refundMode) return;
+
         require(identifier == priceIdentifier, "Wrong identifier");
         require(keccak256(ancillaryData) == keccak256(customAncillaryData), "Wrong ancillary data");
 
@@ -199,6 +216,8 @@ contract EventBasedPredictionMarket is Testable {
      * @param timestamp The request timestamp.
      * @param ancillaryData The ancillary data.
      * @param refund The proposer reward refunded to this contract.
+     * In refundMode this is a no-op that must never revert (the OO calls it without try/catch, so a revert
+     * would block the dispute); no new request is made since the oracle result is ignored.
      */
     function priceDisputed(
         bytes32 identifier,
@@ -208,6 +227,10 @@ contract EventBasedPredictionMarket is Testable {
     ) external {
         OptimisticOracleV2Interface optimisticOracle = getOptimisticOracle();
         require(msg.sender == address(optimisticOracle), "Not authorized");
+
+        // Refund mode: ignore the dispute (no re-request, no deadline / disputeCount change).
+        if (refundMode) return;
+
         require(timestamp == requestTimestamp, "Wrong timestamp");
         require(identifier == priceIdentifier, "Wrong identifier");
         require(keccak256(ancillaryData) == keccak256(customAncillaryData), "Wrong ancillary data");
@@ -244,6 +267,8 @@ contract EventBasedPredictionMarket is Testable {
 
     /**
      * @notice Redeem equal pairs of Long + Short tokens for collateral (1:1, pre-settlement).
+     * Remains correct in refundMode: a pair is worth 0.5 + 0.5 = 1 there too, and burning one Long and one Short
+     * for 1 collateral keeps the invariant (longSupply + shortSupply) * 0.5 == collateral balance intact.
      * @param tokensToRedeem Number of token pairs to burn.
      */
     function redeem(uint256 tokensToRedeem) public {
@@ -263,6 +288,7 @@ contract EventBasedPredictionMarket is Testable {
         uint256 longTokensToRedeem,
         uint256 shortTokensToRedeem
     ) public returns (uint256 collateralReturned) {
+        require(!refundMode, "Refund mode: use emergencyRefund()");
         require(receivedSettlementPrice, "Price not yet resolved");
 
         require(longToken.burnFrom(msg.sender, longTokensToRedeem));
@@ -287,6 +313,17 @@ contract EventBasedPredictionMarket is Testable {
      * Pays out at a neutral 0.5/0.5 split (same math as an "Undetermined" OO result), since the true
      * outcome was never established. Directional (one-sided) holders are otherwise unable to exit —
      * redeem() only works for matched Long+Short pairs.
+     * The first successful call latches refundMode, permanently switching the market to the 0.5/0.5 split;
+     * the oracle-state guard above applies only to that first call. Once latched, any later OO proposal
+     * (which moves the request out of Requested, and eventually to Settled) is ignored, so the guard is
+     * skipped and the remaining holders can always exit.
+     * Solvency: before the first refund collateral == longSupply == shortSupply, so
+     * (longSupply + shortSupply) * 0.5 == collateral. Every refund burns n tokens and pays n / 2, preserving
+     * that invariant. When the last token is burned, the remaining balance (rounding dust) is paid out too.
+     * In refundMode any collateral beyond (longSupply + shortSupply) * 0.5 — rounding dust, a proposer reward
+     * refunded by the OO on a post-latch dispute, or collateral donated directly to this contract — is
+     * taken by whoever makes the last emergencyRefund() (the call that burns the final token). If the last
+     * holder leaves through redeem() instead, that excess stays in the contract.
      * @param longTokensToRedeem Number of Long tokens to redeem.
      * @param shortTokensToRedeem Number of Short tokens to redeem.
      * @return collateralReturned Total collateral returned.
@@ -297,11 +334,17 @@ contract EventBasedPredictionMarket is Testable {
     ) public requestInitialized returns (uint256 collateralReturned) {
         require(getCurrentTime() > settlementDeadline, "Settlement deadline not reached");
         require(!receivedSettlementPrice, "Price already resolved, use settle()");
-        require(
-            getOptimisticOracle().getState(address(this), priceIdentifier, requestTimestamp, customAncillaryData) ==
-                OptimisticOracleV2Interface.State.Requested,
-            "Oracle resolution in progress"
-        );
+        // A no-op call must not be able to latch refundMode (that would cancel the oracle outcome for everyone).
+        require(longTokensToRedeem + shortTokensToRedeem > 0, "Nothing to refund");
+        if (!refundMode) {
+            require(
+                getOptimisticOracle().getState(address(this), priceIdentifier, requestTimestamp, customAncillaryData) ==
+                    OptimisticOracleV2Interface.State.Requested,
+                "Oracle resolution in progress"
+            );
+            // Latch: from this point the oracle result is ignored.
+            refundMode = true;
+        }
 
         require(longToken.burnFrom(msg.sender, longTokensToRedeem));
         require(shortToken.burnFrom(msg.sender, shortTokensToRedeem));
@@ -309,6 +352,11 @@ contract EventBasedPredictionMarket is Testable {
         // Undetermined-equivalent split: every token (long or short) is worth exactly 0.5 collateral,
         // since no outcome was ever established.
         collateralReturned = ((longTokensToRedeem + shortTokensToRedeem) * 5e17) / 1e18;
+
+        // Last holder out takes whatever is left (rounding dust from odd-wei redemptions).
+        if (longToken.totalSupply() + shortToken.totalSupply() == 0) {
+            collateralReturned = collateralToken.balanceOf(address(this));
+        }
         collateralToken.safeTransfer(msg.sender, collateralReturned);
 
         emit EmergencyRefund(msg.sender, collateralReturned, longTokensToRedeem, shortTokensToRedeem);
