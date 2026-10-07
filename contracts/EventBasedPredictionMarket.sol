@@ -31,6 +31,11 @@ import "@uma/core/contracts/data-verification-mechanism/interfaces/IdentifierWhi
  *      The first successful emergencyRefund() latches refundMode: from then on the market is terminal,
  *      every remaining token (Long or Short) is worth exactly 0.5 collateral, and any OO proposal,
  *      dispute or settlement arriving afterwards is ignored (see priceSettled / priceDisputed).
+ *      DESIGN (intentional): once settlementDeadline has passed and receivedSettlementPrice is false
+ *      (and the current request has no proposal in progress), ANY token holder — even one holding a
+ *      dust amount — can force the market into neutral 0.5/0.5 settlement. The only extra guard is that
+ *      a refund must pay out something: a call whose payout rounds to zero reverts with
+ *      "Refund rounds to zero", except the final exit, which sweeps the remaining balance.
  *
  * Resolution values:
  *   - 1e18 (YES): Long tokens worth 1 collateral each, Short tokens worth 0.
@@ -324,6 +329,16 @@ contract EventBasedPredictionMarket is Testable {
      * refunded by the OO on a post-latch dispute, or collateral donated directly to this contract — is
      * taken by whoever makes the last emergencyRefund() (the call that burns the final token). If the last
      * holder leaves through redeem() instead, that excess stays in the contract.
+     *
+     * Permissionless by design: after the deadline, with no price received and no proposal in progress, ANY
+     * holder (even of a dust amount) can latch refundMode and thereby force neutral 0.5/0.5 settlement.
+     * The payout is pre-computed before anything is burned or latched and must be non-zero: a refund that
+     * rounds to zero (e.g. 1 wei of tokens) reverts with "Refund rounds to zero", so it cannot latch
+     * refundMode for free. Exception: the call that burns the final outstanding tokens may pre-compute 0
+     * because it sweeps the remaining contract balance. That exemption can never be the latching call:
+     * before the first latch Long and Short supply are equal, so burning the whole supply means >= 2
+     * tokens and a pre-computed payout >= 1. After a latch, a non-final holder of 1 wei cannot exit alone
+     * but can transfer the token to another holder and exit as part of a larger amount.
      * @param longTokensToRedeem Number of Long tokens to redeem.
      * @param shortTokensToRedeem Number of Short tokens to redeem.
      * @return collateralReturned Total collateral returned.
@@ -336,6 +351,16 @@ contract EventBasedPredictionMarket is Testable {
         require(!receivedSettlementPrice, "Price already resolved, use settle()");
         // A no-op call must not be able to latch refundMode (that would cancel the oracle outcome for everyone).
         require(longTokensToRedeem + shortTokensToRedeem > 0, "Nothing to refund");
+
+        // Undetermined-equivalent split: every token (long or short) is worth exactly 0.5 collateral,
+        // since no outcome was ever established. Computed before latching/burning so a zero payout is rejected.
+        collateralReturned = ((longTokensToRedeem + shortTokensToRedeem) * 5e17) / 1e18;
+
+        // The final exit sweeps the whole remaining balance below, so it is exempt from the zero-payout check.
+        bool lastExit = longToken.totalSupply() == longTokensToRedeem &&
+            shortToken.totalSupply() == shortTokensToRedeem;
+        require(collateralReturned > 0 || lastExit, "Refund rounds to zero");
+
         if (!refundMode) {
             require(
                 getOptimisticOracle().getState(address(this), priceIdentifier, requestTimestamp, customAncillaryData) ==
@@ -349,12 +374,8 @@ contract EventBasedPredictionMarket is Testable {
         require(longToken.burnFrom(msg.sender, longTokensToRedeem));
         require(shortToken.burnFrom(msg.sender, shortTokensToRedeem));
 
-        // Undetermined-equivalent split: every token (long or short) is worth exactly 0.5 collateral,
-        // since no outcome was ever established.
-        collateralReturned = ((longTokensToRedeem + shortTokensToRedeem) * 5e17) / 1e18;
-
         // Last holder out takes whatever is left (rounding dust from odd-wei redemptions).
-        if (longToken.totalSupply() + shortToken.totalSupply() == 0) {
+        if (lastExit) {
             collateralReturned = collateralToken.balanceOf(address(this));
         }
         collateralToken.safeTransfer(msg.sender, collateralReturned);
