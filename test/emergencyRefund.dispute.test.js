@@ -419,7 +419,7 @@ describe("EventBasedPredictionMarket refundMode (late oracle activity after a re
     expect(await market.refundMode()).to.equal(false);
   });
 
-  it("slow DVM (> 72h after a dispute): a 1-wei holder CAN latch refundMode once the re-request has no proposal", async () => {
+  it("slow DVM (> 72h after a dispute): a 2-wei holder CAN latch refundMode once the re-request has no proposal", async () => {
     const ctx = await deploy();
     const { alice, bob, timer, oo, oracle, usdc, market, ancillary } = ctx;
     await split(ctx);
@@ -433,7 +433,7 @@ describe("EventBasedPredictionMarket refundMode (late oracle activity after a re
     await warpTo(timer, dl + 1);
     expect(await oo.getState(market.target, IDENT, ts0, ancillary)).to.equal(4n); // old request still Disputed
 
-    await market.connect(alice).emergencyRefund(1n, 0); // 1 wei Long
+    await market.connect(alice).emergencyRefund(2n, 0); // 2 wei Long
     expect(await market.refundMode()).to.equal(true);
 
     // The old (disputed) request resolving later has no effect on the market: not before the latch either,
@@ -443,7 +443,7 @@ describe("EventBasedPredictionMarket refundMode (late oracle activity after a re
     await oo.settle(market.target, IDENT, ts0, ancillary);
     expect(await market.receivedSettlementPrice()).to.equal(false);
     await market.connect(bob).emergencyRefund(0, E(100));
-    await market.connect(alice).emergencyRefund(E(100) - 1n, 0);
+    await market.connect(alice).emergencyRefund(E(100) - 2n, 0);
     expect(await usdc.balanceOf(market.target)).to.equal(0);
   });
 });
@@ -541,5 +541,115 @@ describe("EventBasedPredictionMarket refundMode with proposerReward > 0 (dispute
     expect(await longTok.totalSupply()).to.equal(0);
     expect(await shortTok.totalSupply()).to.equal(0);
     expect(await usdc.balanceOf(market.target)).to.equal(REWARD); // stuck: nobody can withdraw it
+  });
+});
+
+describe("EventBasedPredictionMarket stale-request callbacks and the zero-payout guard", () => {
+  const BOND = E(11); // bond 10 + final fee 1
+
+  const setup = async (amount) => {
+    const ctx = await deploy();
+    const { alice, usdc, market } = ctx;
+    const longTok = await ethers.getContractAt("ExpandedERC20", await market.longToken());
+    const shortTok = await ethers.getContractAt("ExpandedERC20", await market.shortToken());
+    await usdc.connect(alice).approve(market.target, amount);
+    await market.connect(alice).create(amount);
+    return { ...ctx, longTok, shortTok };
+  };
+  const pastDeadline = async ({ timer, market }) => warpTo(timer, Number(await market.settlementDeadline()) + 1);
+
+  it("stale request: after a dispute the old request's DVM-resolved priceSettled is ignored; the new request still settles", async () => {
+    const ctx = await setup(E(100));
+    const { alice, proposer, disputer, timer, oo, oracle, usdc, market, ancillary } = ctx;
+
+    const ts0 = Number(await market.requestTimestamp());
+    await warpTo(timer, ts0 + 1 * H);
+    await usdc.connect(proposer).approve(oo.target, BOND);
+    await oo.connect(proposer).proposePrice(market.target, IDENT, ts0, ancillary, E(1));
+    await usdc.connect(disputer).approve(oo.target, BOND);
+    await oo.connect(disputer).disputePrice(market.target, IDENT, ts0, ancillary);
+    const ts1 = Number(await market.requestTimestamp());
+    expect(ts1).to.be.gt(ts0); // priceDisputed re-requested
+
+    // DVM resolves the OLD (disputed) request as NO; settling it fires priceSettled(ts0, NO) with the stale timestamp.
+    const [q] = await oracle.getPendingQueries();
+    await oracle.pushPrice(q.identifier, q.time, q.ancillaryData, 0);
+    await oo.settle(market.target, IDENT, ts0, ancillary); // must not revert
+
+    expect(await market.receivedSettlementPrice()).to.equal(false);
+    expect(Number(await market.requestTimestamp())).to.equal(ts1);
+    expect(await market.expiryPrice()).to.equal(0);
+    expect(await market.settlementPrice()).to.equal(0);
+    expect(await market.refundMode()).to.equal(false);
+
+    // The new request is unaffected and resolves normally (YES): Long pays 1:1.
+    await usdc.connect(proposer).approve(oo.target, BOND);
+    await oo.connect(proposer).proposePrice(market.target, IDENT, ts1, ancillary, E(1));
+    await warpTo(timer, (await now(timer)) + 24 * H + 1);
+    await oo.settle(market.target, IDENT, ts1, ancillary);
+    expect(await market.receivedSettlementPrice()).to.equal(true);
+    expect(await market.settlementPrice()).to.equal(E(1));
+    const before = await usdc.balanceOf(alice.address);
+    await market.connect(alice).settle(E(100), 0);
+    expect((await usdc.balanceOf(alice.address)) - before).to.equal(E(100));
+  });
+
+  it("1 wei cannot latch (reverts, refundMode stays false); a 2 wei dust holder can, and the others still exit at exactly 0.5", async () => {
+    const ctx = await setup(E(100));
+    const { alice, bob, proposer: dust, usdc, market, longTok, shortTok } = ctx;
+    await longTok.connect(alice).transfer(dust.address, 2n);
+    await shortTok.connect(alice).transfer(bob.address, E(100));
+    await pastDeadline(ctx);
+
+    await expect(market.connect(dust).emergencyRefund(1n, 0)).to.be.revertedWith("Refund rounds to zero");
+    expect(await market.refundMode()).to.equal(false);
+
+    await market.connect(dust).emergencyRefund(2n, 0); // 2 wei -> 1 wei, latches
+    expect(await market.refundMode()).to.equal(true);
+
+    const a0 = await usdc.balanceOf(alice.address);
+    await market.connect(alice).emergencyRefund(E(100) - 2n, 0);
+    expect((await usdc.balanceOf(alice.address)) - a0).to.equal(E(50) - 1n);
+
+    const b0 = await usdc.balanceOf(bob.address);
+    await market.connect(bob).emergencyRefund(0, E(100)); // last out: sweep == exactly 0.5 per token
+    expect((await usdc.balanceOf(bob.address)) - b0).to.equal(E(50));
+
+    expect(await usdc.balanceOf(market.target)).to.equal(0);
+    expect(await longTok.totalSupply()).to.equal(0);
+    expect(await shortTok.totalSupply()).to.equal(0);
+  });
+
+  it("after latch: a non-final 1 wei exit reverts, but after merging into one holder (2 wei) it can exit as the last one", async () => {
+    const ctx = await setup(4n);
+    const { alice, bob, proposer: carol, usdc, market, shortTok } = ctx;
+    await shortTok.connect(alice).transfer(bob.address, 1n);
+    await shortTok.connect(alice).transfer(carol.address, 1n);
+    await pastDeadline(ctx);
+
+    await market.connect(alice).emergencyRefund(4n, 2n); // 6 wei -> 3, latches; 1 wei left in the pool
+    expect(await market.refundMode()).to.equal(true);
+    expect(await usdc.balanceOf(market.target)).to.equal(1n);
+
+    await expect(market.connect(bob).emergencyRefund(0, 1n)).to.be.revertedWith("Refund rounds to zero");
+    await shortTok.connect(bob).transfer(carol.address, 1n);
+
+    const c0 = await usdc.balanceOf(carol.address);
+    await market.connect(carol).emergencyRefund(0, 2n); // 2 wei -> 1 wei, and it is the last exit
+    expect((await usdc.balanceOf(carol.address)) - c0).to.equal(1n);
+    expect(await usdc.balanceOf(market.target)).to.equal(0);
+  });
+
+  it("final 1 wei exit (pre-computed payout 0) is exempt from the guard and sweeps the balance", async () => {
+    const ctx = await setup(3n);
+    const { alice, bob, usdc, market, shortTok } = ctx;
+    await shortTok.connect(alice).transfer(bob.address, 1n);
+    await pastDeadline(ctx);
+
+    await market.connect(alice).emergencyRefund(3n, 2n); // 5 wei -> 2, latches; pool 1 wei
+    const b0 = await usdc.balanceOf(bob.address);
+    await market.connect(bob).emergencyRefund(0, 1n); // pre-computed 0, but last out
+    expect((await usdc.balanceOf(bob.address)) - b0).to.equal(1n);
+    expect(await usdc.balanceOf(market.target)).to.equal(0);
   });
 });
